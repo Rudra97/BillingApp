@@ -129,7 +129,7 @@ with st.sidebar:
         load_catalog_df.clear()
         load_catalog_images.clear()
         build_phash_index.clear()
-        st.experimental_rerun()
+        st.rerun()
 
 # ---------- Camera / Upload ----------
 st.subheader("1) Take a photo (or upload)")
@@ -308,3 +308,4 @@ if st.session_state.cart:
     st.caption("Excel includes: Items sheet (with totals) + Images sheet (thumbnails).")
 else:
     st.info("Add items to cart to enable export.")
+
