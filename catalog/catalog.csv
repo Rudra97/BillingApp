@@ -1,4 +1,8 @@
-item_name,price,image_path
-Apple,20,apple.jpg
-Rice Bag 5kg,320,rice_bag.jpg
-Milk 1L,55,milk1l.jpg
+item_name,price,cost_price,image_path
+2 in 1 gudiya flower,600,300,images/2 in 1 gudiya flower pot.jpeg
+cock penta sky flash,512,256,images/cock penta sky flash.jpeg
+cock sky shot,200,100,images/cock sky shot.jpeg
+cock sky whistle rocket,220,110,images/cock sky whistle rocket.jpeg
+cock 12 shot,240,120,images/cock 12 shot.jpeg
+Ground Chakkar 45 cm ,320,160,images/Ground Chakkar 45 cm.jpeg
+jasmine 5 pc matka,440,220,images/jasmine 5 pc matka.jpeg

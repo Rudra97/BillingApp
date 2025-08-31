@@ -1,7 +1,12 @@
 streamlit
 pandas
-pillow
-imagehash
-openpyxl
-xlsxwriter
 numpy
+Pillow
+torch
+torchvision
+transformers
+matplotlib
+scikit-learn
+xlsxwriter
+imagehash
+open-clip-torch
