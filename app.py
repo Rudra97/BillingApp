@@ -1,311 +1,534 @@
 import io
 import os
-import hashlib
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageOps
+
 import streamlit as st
-import imagehash
-import xlsxwriter  # via pandas ExcelWriter engine
+import matplotlib.pyplot as plt
+from html2image import Html2Image
+
+
+# --- OpenCV ORB ---
+import cv2
+
+# --- CLIP (fallback) ---
+import torch
+from sklearn.metrics.pairwise import cosine_similarity
+from open_clip import create_model_and_transforms, get_tokenizer
 
 # ---------------------- CONFIG ----------------------
 CATALOG_DIR = Path("catalog")
 CATALOG_CSV = CATALOG_DIR / "catalog.csv"
-IMAGES_BASE = CATALOG_DIR  # image_path in CSV is relative to /catalog
-PHASH_SIZE = 16            # larger = more detail (default 8). 16 is robust.
-DEFAULT_THRESHOLD = 12     # max Hamming distance to auto-accept a match
-# ----------------------------------------------------
+BILL_LOG_PATH = Path("generated_bills/billing_log.csv")
 
-st.set_page_config(page_title="Snap → Item Sheet", page_icon="📸", layout="wide")
-st.title("📸 Snap → Item Sheet (Personal)")
-st.caption("Click photos, auto-recognize items against your own catalog, edit quantities, and export Excel.")
+st.set_page_config(page_title="CLIP/ORB Billing", page_icon="📸", layout="wide")
+tab1, tab2 = st.tabs(["🧾 Billing", "📊 Analytics"])
 
-# ---------- Utilities ----------
-def safe_open_image(path: Path) -> Image.Image:
-    im = Image.open(path).convert("RGB")
-    return im
+# ---------------------- CLIP Setup (fallback) ----------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model, _, preprocess = create_model_and_transforms("ViT-B-32", pretrained="openai", device=device)
+tokenizer = get_tokenizer("ViT-B-32")
 
-def phash_bytes(img_bytes: bytes) -> imagehash.ImageHash:
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    return imagehash.phash(img, hash_size=PHASH_SIZE)
+def _l2norm(x: np.ndarray) -> np.ndarray:
+    return x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-12)
 
-def phash_image(img: Image.Image) -> imagehash.ImageHash:
-    return imagehash.phash(img.convert("RGB"), hash_size=PHASH_SIZE)
+@st.cache_data(show_spinner=False)
+def embed_image_clip(image: Image.Image) -> np.ndarray:
+    # Fix EXIF orientation then preprocess
+    image = ImageOps.exif_transpose(image)
+    img_tensor = preprocess(image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        feats = model.encode_image(img_tensor).float()
+    emb = feats.cpu().numpy().astype("float32")
+    return _l2norm(emb)
 
-def digest_bytes(b: bytes) -> str:
-    return hashlib.sha1(b).hexdigest()
+def best_query_clip_embs(image: Image.Image) -> Tuple[np.ndarray, List[int]]:
+    """4 rotations (0,90,180,270); returns stacked normalized embeddings (4,D)."""
+    angles = [0, 90, 180, 270]
+    embs = []
+    for ang in angles:
+        im = image if ang == 0 else image.rotate(ang, expand=True)
+        embs.append(embed_image_clip(im))
+    return np.vstack(embs), angles
 
+# ---------------------- Catalog Loading ----------------------
 @st.cache_data(show_spinner=False)
 def load_catalog_df(csv_path: Path) -> pd.DataFrame:
     if not csv_path.exists():
         return pd.DataFrame(columns=["item_name", "price", "image_path"])
     df = pd.read_csv(csv_path)
-    required = {"item_name", "price", "image_path"}
-    missing = required - set(map(str.lower, df.columns))
-    # normalize column names
-    cols_map = {c: c.lower() for c in df.columns}
-    df.rename(columns=cols_map, inplace=True)
-    if missing:
-        st.error(f"`catalog.csv` is missing columns: {missing}. Expected: {required}")
-    return df[["item_name", "price", "image_path"]].copy()
+    # allow optional cost_price column
+    cols = ["item_name", "price", "image_path"] + (["cost_price"] if "cost_price" in df.columns else [])
+    return df[cols].copy()
 
 @st.cache_data(show_spinner=False)
-def load_catalog_images(df: pd.DataFrame) -> Dict[str, bytes]:
-    """Return {item_name -> image_bytes} for catalog images."""
-    out = {}
+def load_and_embed_catalog_clip(df: pd.DataFrame):
+    """Return maps + names + CLIP embedding matrix (normalized)."""
+    price_map, embeddings, raw_images = {}, {}, {}
     for _, row in df.iterrows():
         name = str(row["item_name"]).strip()
-        rel = str(row["image_path"]).strip()
-        full = (IMAGES_BASE / rel).resolve()
-        if full.exists():
-            try:
-                out[name] = full.read_bytes()
-            except Exception:
-                pass
-    return out
+        price = float(row["price"])
+        image_path = CATALOG_DIR / row["image_path"]
+        if not image_path.exists():
+            continue
+        try:
+            img = Image.open(image_path).convert("RGB")
+            price_map[name] = price
+            raw_images[name] = image_path.read_bytes()
+            embeddings[name] = embed_image_clip(img)  # normalized
+        except Exception:
+            continue
 
-@st.cache_data(show_spinner=False)
-def build_phash_index(df: pd.DataFrame) -> List[Tuple[str, imagehash.ImageHash]]:
-    """List of (item_name, phash) for catalog images."""
-    index = []
+    names = list(embeddings.keys())
+    if names:
+        emb_matrix = np.vstack([embeddings[n] for n in names])  # (N,D)
+    else:
+        emb_matrix = np.zeros((0, 512), dtype="float32")
+    return price_map, embeddings, raw_images, names, emb_matrix
+
+# ---------------------- ORB Catalog Index ----------------------
+@st.cache_resource(show_spinner=False)
+def build_orb_index(df: pd.DataFrame):
+    """
+    Build ORB descriptors for each catalog image.
+    Returns: dict[name] = {"desc": np.ndarray, "kp": list, "shape": (h,w)}
+    """
+    orb = cv2.ORB_create(nfeatures=2000, scaleFactor=1.2, nlevels=8, edgeThreshold=31)
+    index = {}
     for _, row in df.iterrows():
         name = str(row["item_name"]).strip()
-        rel = str(row["image_path"]).strip()
-        full = (IMAGES_BASE / rel).resolve()
-        if full.exists():
-            try:
-                im = safe_open_image(full)
-                index.append((name, phash_image(im)))
-            except Exception:
-                pass
+        image_path = CATALOG_DIR / row["image_path"]
+        if not image_path.exists():
+            continue
+        try:
+            # robust read (handles non-ascii paths)
+            img = cv2.imdecode(np.fromfile(str(image_path), dtype=np.uint8), cv2.IMREAD_COLOR)
+            if img is None:
+                continue
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            kp, desc = orb.detectAndCompute(gray, None)
+            if desc is not None and len(kp) >= 10:
+                index[name] = {"desc": desc, "kp": kp, "shape": gray.shape}
+        except Exception:
+            pass
     return index
 
-def match_item_by_phash(query_bytes: bytes, index: List[Tuple[str, imagehash.ImageHash]], topk: int = 3):
-    qh = phash_bytes(query_bytes)
-    dists = []
-    for name, h in index:
-        d = qh - h  # Hamming distance
-        dists.append((name, d))
-    dists.sort(key=lambda x: x[1])
-    return dists[:topk]
+def _rotate_pil(img: Image.Image, angle: int) -> Image.Image:
+    return img if angle == 0 else img.rotate(angle, expand=True)
 
-def format_money(x: float) -> str:
-    try:
-        return f"{x:,.2f}"
-    except Exception:
-        return str(x)
+def _pil_to_cv2(img: Image.Image) -> np.ndarray:
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-# ---------- Load Catalog ----------
-catalog_df = load_catalog_df(CATALOG_CSV)
-if catalog_df.empty:
-    st.warning("Catalog is empty. Create `catalog/catalog.csv` and put images in `catalog/images/` (see example above).")
-catalog_images = load_catalog_images(catalog_df)
-phash_index = build_phash_index(catalog_df)
+def match_with_orb(query_pil: Image.Image, orb_index: Dict[str, dict],
+                   min_inliers: int = 12, top_k: int = 5) -> List[Tuple[str, int]]:
+    """
+    Try orientations {0,90,180,270}; for each, compute ORB and match to catalog with FLANN+RANSAC.
+    Returns sorted list of (name, inlier_count).
+    """
+    if not orb_index:
+        return []
 
-# Quick lookup maps
-price_lookup = {str(r.item_name).strip(): float(r.price) for r in catalog_df.itertuples()}
-image_lookup = catalog_images  # {item_name -> image_bytes}
+    orb = cv2.ORB_create(nfeatures=2000, scaleFactor=1.2, nlevels=8)
+    index_items = list(orb_index.items())
+    FLANN_INDEX_LSH = 6
+    flann = cv2.FlannBasedMatcher(
+        dict(algorithm=FLANN_INDEX_LSH, table_number=12, key_size=20, multi_probe_level=2),
+        dict(checks=64)
+    )
 
-# ---------- Session State ----------
-if "cart" not in st.session_state:
-    # cart is an aggregator: item_name -> {"price": float, "qty": int}
-    st.session_state.cart: Dict[str, Dict[str, float | int]] = {}
+    best_scores = {}
+    for ang in (0, 90, 180, 270):
+        q_img = _rotate_pil(query_pil, ang)
+        q_bgr = _pil_to_cv2(q_img)
+        q_gray = cv2.cvtColor(q_bgr, cv2.COLOR_BGR2GRAY)
+        q_kp, q_desc = orb.detectAndCompute(q_gray, None)
+        if q_desc is None or len(q_kp) < 10:
+            continue
 
-if "scans" not in st.session_state:
-    # keep raw scans history (optional)
-    st.session_state.scans: List[Dict] = []
+        for name, data in index_items:
+            c_desc = data["desc"]
+            c_kp   = data["kp"]
 
-# ---------- Sidebar Settings ----------
-with st.sidebar:
-    st.header("Settings")
-    currency = st.text_input("Currency symbol", "₹")
-    threshold = st.slider("Match threshold (lower = stricter)", 4, 30, DEFAULT_THRESHOLD)
-    st.caption("If best match distance ≤ threshold, we auto-select it. Otherwise you can pick manually.")
-    if st.button("🔁 Reload catalog"):
-        load_catalog_df.clear()
-        load_catalog_images.clear()
-        build_phash_index.clear()
-        st.rerun()
+            # kNN match (k=2) + Lowe ratio
+            matches = flann.knnMatch(q_desc, c_desc, k=2)
+            good = []
+            for match in matches:
+                if len(match) == 2:
+                    m, n = match
+                    if m.distance < 0.75 * n.distance:
+                        good.append(m)
 
-# ---------- Camera / Upload ----------
-st.subheader("1) Take a photo (or upload)")
-cam_img = st.camera_input("Tap here to capture (mobile camera supported)")
-upload_imgs = st.file_uploader("Or upload one or more photos", type=["png", "jpg", "jpeg", "webp", "bmp"], accept_multiple_files=True)
+            # RANSAC homography to count inliers (geometric consistency)
+            src_pts = np.float32([q_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+            dst_pts = np.float32([c_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
 
-new_photos: List[Tuple[str, bytes]] = []
-if cam_img is not None:
-    raw = cam_img.getvalue()
-    new_photos.append((f"camera_{digest_bytes(raw)[:10]}.png", raw))
+            H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+            inliers = int(mask.sum()) if mask is not None else 0
 
-if upload_imgs:
-    for f in upload_imgs:
-        new_photos.append((f.name, f.read()))
+            if (name not in best_scores) or (inliers > best_scores[name]):
+                best_scores[name] = inliers
 
-# ---------- Matching & Add to Cart ----------
-st.subheader("2) Recognize & add to cart")
-col_left, col_right = st.columns([1, 1], gap="large")
+    ranked = sorted(best_scores.items(), key=lambda x: -x[1])[:top_k]
+    return ranked
 
-with col_left:
-    if new_photos:
-        for fname, raw in new_photos:
-            st.write(f"**Photo:** {fname}")
-            try:
-                st.image(Image.open(io.BytesIO(raw)).convert("RGB"), use_container_width=True)
-            except Exception:
-                st.warning("Preview failed")
+# ---------------------- CLIP Fallback Top-K ----------------------
+def find_top_matches_clip(query_img: Image.Image,
+                          catalog_names: List[str],
+                          catalog_matrix: np.ndarray,
+                          top_k: int = 5) -> List[Tuple[str, float]]:
+    q_embs, _ = best_query_clip_embs(query_img)  # (4,D)
+    if len(catalog_matrix) == 0:
+        return []
+    sims = q_embs @ catalog_matrix.T  # dot product == cosine (normalized)
+    sims = sims.max(axis=0)           # best over rotations
+    idxs = np.argsort(-sims)[:top_k]
+    return [(catalog_names[i], float(sims[i])) for i in idxs]
 
-            if len(phash_index) == 0:
-                st.error("No catalog images indexed. Add items to catalog first.")
-                continue
+# ---------------------- Billing App ----------------------
+with tab1:
+    st.title("📸 AI Billing (ORB + CLIP fallback)")
+    st.caption("Upload/capture a photo → match to catalog. ORB is robust to rotation/perspective; CLIP is used as fallback.")
 
-            top_matches = match_item_by_phash(raw, phash_index, topk=3)
-            best_name, best_dist = top_matches[0]
+    catalog_df = load_catalog_df(CATALOG_CSV)
+    if catalog_df.empty:
+        st.warning("Catalog is empty. Fill catalog/catalog.csv and put images in catalog/images/")
+    price_lookup, catalog_embeddings, catalog_images, catalog_names, catalog_matrix = load_and_embed_catalog_clip(catalog_df)
+    orb_index = build_orb_index(catalog_df)
 
-            st.caption(f"Top matches (phash distance): " + ", ".join([f"{n} ({d})" for n, d in top_matches]))
-            auto_pick = best_dist <= threshold
+    if "cart" not in st.session_state:
+        st.session_state.cart: Dict[str, Dict[str, float | int]] = {}
 
-            if auto_pick:
-                st.success(f"Auto-selected: **{best_name}**  (distance {best_dist})")
-                default_item = best_name
-            else:
-                st.warning("Low confidence. Please select the correct item.")
-                default_item = None
+    st.subheader("1) Upload/Scan Image")
+    cam_img = st.camera_input("📷 Capture")
+    uploaded_imgs = st.file_uploader("Or upload image(s)", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
 
-            # let user confirm / override
-            chosen = st.selectbox("Item", options=list(price_lookup.keys()), index=(list(price_lookup.keys()).index(default_item) if (default_item in price_lookup) else 0))
+    latest_photo: Optional[Tuple[str, bytes]] = None
+    if cam_img:
+        latest_photo = ("camera.png", cam_img.getvalue())
+    elif uploaded_imgs:
+        latest_photo = (uploaded_imgs[-1].name, uploaded_imgs[-1].read())
+
+    st.subheader("2) AI Matching + Add to Cart")
+    if latest_photo:
+        fname, raw = latest_photo
+        try:
+            image = Image.open(io.BytesIO(raw)).convert("RGB")
+
+            # Match logic
+            matched_name: Optional[str] = None
+            orb_matches = match_with_orb(image, orb_index, min_inliers=12, top_k=5)
+
+            if orb_matches:
+                best_name, inliers = orb_matches[0]
+                if inliers >= 15:
+                    matched_name = best_name
+                    st.success(f"✅ ORB match: **{best_name}** (inliers: {inliers})")
+                else:
+                    st.warning(f"Low ORB confidence (inliers={inliers}). Pick from suggestions or let CLIP help:")
+                    choice = st.radio(
+                        "ORB suggestions",
+                        [f"{n} (inliers={s})" for n, s in orb_matches],
+                        index=0, key=f"orb_sugg_{fname}"
+                    )
+                    matched_name = choice.split(" (")[0]
+
+            if matched_name is None:
+                clip_top = find_top_matches_clip(image, catalog_names, catalog_matrix, top_k=5)
+                if clip_top:
+                    c_best, c_score = clip_top[0]
+                    if c_score >= 0.40:
+                        matched_name = c_best
+                        st.info(f"ℹ️ CLIP fallback: **{c_best}** (score: {c_score:.2f})")
+                    else:
+                        st.warning(f"No confident CLIP match (best={c_score:.2f}). Pick from top suggestions:")
+                        suggestion = st.radio(
+                            "CLIP suggestions",
+                            [f"{n} ({s:.2f})" for n, s in clip_top],
+                            index=0, key=f"clip_sugg_{fname}"
+                        )
+                        matched_name = suggestion.split(" (")[0]
+                else:
+                    st.warning("No match candidates. Choose manually.")
+                    matched_name = st.selectbox("Choose manually", options=list(price_lookup.keys()),
+                                                key=f"manual_{fname}")
+
+            # Show matched item image only (not uploaded image)
+            if matched_name:
+                catalog_image_path = CATALOG_DIR / catalog_df.set_index("item_name").at[matched_name, "image_path"]
+                if catalog_image_path.exists():
+                    matched_img = Image.open(catalog_image_path).convert("RGB")
+                    st.image(matched_img, caption=f"Matched: {matched_name}", width=160)
+
+            default_price = float(price_lookup.get(matched_name, 0.0))
             qty = st.number_input("Quantity", min_value=1, step=1, value=1, key=f"qty_{fname}")
-            unit_price = st.number_input("Unit price", min_value=0.0, step=0.5, value=float(price_lookup.get(chosen, 0.0)), key=f"price_{fname}")
+            price = st.number_input("Selling Price", min_value=0.0, value=default_price, key=f"price_{fname}")
+            cost_price = catalog_df.set_index("item_name").get("cost_price", pd.Series()).get(matched_name, 0.0)
 
-            if st.button("➕ Add to cart", key=f"add_{fname}"):
-                # aggregate into cart
-                if chosen not in st.session_state.cart:
-                    st.session_state.cart[chosen] = {"price": unit_price, "qty": 0}
-                # If catalog had a different price but user edited, keep user's latest
-                st.session_state.cart[chosen]["price"] = float(unit_price)
-                st.session_state.cart[chosen]["qty"] += int(qty)
+            if st.button("➕ Add to Cart", key=f"add_{fname}"):
+                st.session_state.cart[matched_name] = {
+                    "price": price,
+                    "qty": qty,
+                    "cost_price": float(cost_price) if pd.notna(cost_price) else 0.0
+                }
+                st.success(f"Added {qty} × {matched_name}")
 
-                # record scan
-                st.session_state.scans.append({"source": fname, "item": chosen, "qty": qty, "price": unit_price})
-                st.success(f"Added {qty} × {chosen}")
+        except Exception as e:
+            st.error(f"Failed to process image. {e}")
+    else:
+        st.info("Please capture or upload an image first.")
 
-with col_right:
-    st.markdown("### Cart (aggregated)")
+    st.divider()
+    st.subheader("🛒 Cart")
+
     if st.session_state.cart:
         items = []
         for name, rec in st.session_state.cart.items():
-            unit = float(rec["price"])
-            q = int(rec["qty"])
-            items.append({
-                "Item Name": name,
-                "Price per Unit": unit,
-                "Total Quantity": q,
-                "Total Price": round(unit * q, 2),
-            })
-        cart_df = pd.DataFrame(items).sort_values("Item Name")
-        # allow edits
-        edited = st.data_editor(
-            cart_df,
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "Item Name": st.column_config.TextColumn(disabled=True),
-                "Price per Unit": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.2f"),
-                "Total Quantity": st.column_config.NumberColumn(min_value=0, step=1),
-                "Total Price": st.column_config.NumberColumn(disabled=True, format="%.2f"),
-            }
-        )
-        # persist edits back to cart
-        for _, row in edited.iterrows():
-            name = row["Item Name"]
-            st.session_state.cart[name]["price"] = float(row["Price per Unit"])
-            st.session_state.cart[name]["qty"] = int(row["Total Quantity"])
-
-        grand_total = sum(float(v["price"]) * int(v["qty"]) for v in st.session_state.cart.values())
-        st.metric("Grand Total", f"{currency}{grand_total:,.2f}")
-        if st.button("🧹 Clear cart"):
-            st.session_state.cart.clear()
-            st.info("Cart cleared.")
-    else:
-        st.info("Cart is empty. Scan or upload photos and add items.")
-
-st.divider()
-
-# ---------- Export to Excel ----------
-def build_excel(cart: Dict[str, Dict[str, float | int]], image_lookup: Dict[str, bytes]) -> bytes:
-    """
-    Creates an .xlsx with:
-    - 'Items' sheet: Item Name, Price per Unit, Total Quantity, Total Price, Grand Total row
-    - 'Images' sheet: Item Name + Thumbnail
-    """
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        wb = writer.book
-
-        # Items sheet
-        rows = []
-        for name, rec in cart.items():
-            unit = float(rec["price"])
             qty = int(rec["qty"])
-            rows.append([name, unit, qty, round(unit * qty, 2)])
-        items_df = pd.DataFrame(rows, columns=["Item Name", "Price per Unit", "Total Quantity", "Total Price"])
-        items_df.to_excel(writer, sheet_name="Items", index=False)
+            price = float(rec["price"])
+            cost = float(rec.get("cost_price", 0.0))
+            profit = (price - cost) * qty
 
-        ws = writer.sheets["Items"]
-        bold = wb.add_format({"bold": True})
-        money = wb.add_format({"num_format": "#,##0.00"})
-        # widths + header bold
-        widths = [40, 18, 16, 18]
-        for i, col in enumerate(items_df.columns):
-            ws.write(0, i, col, bold)
-            ws.set_column(i, i, widths[i])
-        ws.set_column(1, 1, widths[1], money)
-        ws.set_column(3, 3, widths[3], money)
+            # Editable fields
+            rec["qty"] = st.number_input(f"Qty - {name}", min_value=1, value=qty, key=f"edit_qty_{name}")
+            rec["price"] = st.number_input(f"Price - {name}", min_value=0.0, value=price, key=f"edit_price_{name}")
 
-        # Grand total row
-        n = len(items_df)
-        ws.write(n + 1, 2, "Grand Total:", bold)
-        ws.write_formula(n + 1, 3, f"=SUM(D2:D{n+1})", money)
+            items.append({
+                "Item": name,
+                "Unit Price": price,
+                "Cost Price": cost,
+                "Qty": qty,
+                "Total": round(price * qty, 2),
+                "Profit": round(profit, 2)
+            })
 
-        # Images sheet
-        img_ws = wb.add_worksheet("Images")
-        img_ws.write(0, 0, "Item Name", bold)
-        img_ws.write(0, 1, "Preview", bold)
-        img_ws.set_column(0, 0, 40)
-        img_ws.set_column(1, 1, 45)
+        df = pd.DataFrame(items)
+        st.dataframe(df, use_container_width=True)
+        grand_total = float(df["Total"].sum())
+        total_profit = float(df["Profit"].sum())
 
-        row = 1
-        for name in cart.keys():
-            img_ws.write(row, 0, name)
-            if name in image_lookup:
-                try:
-                    im = Image.open(io.BytesIO(image_lookup[name])).convert("RGB")
-                    im.thumbnail((320, 240))
-                    bio = io.BytesIO()
-                    im.save(bio, format="PNG")
-                    bio.seek(0)
-                    img_ws.insert_image(row, 1, f"{name}.png", {"image_data": bio})
-                except Exception:
-                    img_ws.write(row, 1, "Preview failed")
+        st.metric("Total (Before Discount)", f"₹{grand_total:,.2f}")
+        st.metric("Estimated Profit", f"₹{total_profit:,.2f}")
+
+        # Discount
+        discount_percent = st.slider("Apply Discount (%)", 0, 50, 0)
+        discount_amt = (grand_total * discount_percent) / 100.0
+        final_total = grand_total - discount_amt
+
+        if discount_percent > 0:
+            st.metric("Discount", f"-₹{discount_amt:,.2f}")
+
+        st.metric("Grand Total (After Discount)", f"₹{final_total:,.2f}")
+
+        st.subheader("🧾 Final Details")
+        billed_to = st.text_input("Customer Name", value="Customer", key="billed_to")
+        mobile = st.text_input("Mobile Number", key="billed_mobile")
+
+        col1, col2 = st.columns(2)
+        if col1.button("✅ Save & Generate Invoice"):
+            if not billed_to or not mobile:
+                st.error("Please fill both customer name and mobile number.")
             else:
-                img_ws.write(row, 1, "No catalog image")
-            row += 10
-    return output.getvalue()
+                # Save CSV
+                now = datetime.now()
+                output_dir = Path("generated_bills")
+                output_dir.mkdir(exist_ok=True)
+                csv_filename = now.strftime(f"{billed_to}_%Y%m%d_%H%M%S.csv")
+                csv_path = output_dir / csv_filename
 
-st.subheader("3) Export")
-if st.session_state.cart:
-    file_name = f"items_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    excel_bytes = build_excel(st.session_state.cart, image_lookup)
-    st.download_button(
-        "⬇️ Download Excel",
-        data=excel_bytes,
-        file_name=file_name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    st.caption("Excel includes: Items sheet (with totals) + Images sheet (thumbnails).")
-else:
-    st.info("Add items to cart to enable export.")
+                df["Billed To"] = billed_to
+                df["Mobile"] = mobile
+                df["timestamp"] = now
+                df["Grand Total"] = final_total
+                if discount_percent > 0:
+                    df["Discount %"] = discount_percent
 
+                customer_df = df.drop(columns=["Cost Price", "Profit"], errors="ignore").copy()
+                customer_df.to_csv(csv_path, index=False)
+
+
+                # Save HTML invoice
+                html_invoice = customer_df.to_html(index=False)
+
+                # Determine discount line only if discount is applied
+                discount_line = f"Discount: ₹{discount_amt:,.2f}<br/>" if discount_percent > 0 else ""
+
+                html_template = f"""
+                <html>
+                <head>
+                    <title>Invoice - {billed_to}</title>
+                    <meta name="viewport" content="width=device-width, initial-scale=1">
+                    <style>
+                        body {{
+                            font-family: 'Segoe UI', sans-serif;
+                            padding: 30px;
+                            background-color: #f9f9f9;
+                            max-width: 900px;
+                            margin: auto;
+                            border: 2px solid #ccc;
+                            border-radius: 8px;
+                        }}
+                        .header {{
+                            text-align: center;
+                            margin-bottom: 30px;
+                        }}
+                        .header h1 {{
+                            margin: 0;
+                            font-size: 2.2rem;
+                            color: #2c3e50;
+                        }}
+                        .header p {{
+                            margin: 4px 0;
+                            font-size: 1.1rem;
+                        }}
+                        table {{
+                            border-collapse: collapse;
+                            width: 100%;
+                            margin-top: 10px;
+                        }}
+                        th, td {{
+                            border: 1px solid #ccc;
+                            padding: 10px;
+                            text-align: left;
+                        }}
+                        th {{
+                            background-color: #2c3e50;
+                            color: white;
+                        }}
+                        .totals {{
+                            margin-top: 20px;
+                            font-size: 1.2rem;
+                            font-weight: bold;
+                            text-align: right;
+                        }}
+                        .footer {{
+                            margin-top: 40px;
+                            text-align: center;
+                            font-style: italic;
+                            color: #555;
+                        }}
+                    </style>
+                </head>
+                <body>
+                    <div class="header">
+                        <h1>🧾 Shyam FC Palwal</h1>
+                        <p><b>Customer:</b> {billed_to} | <b>Mobile:</b> {mobile}</p>
+                        <p><b>Date:</b> {now.strftime('%d-%m-%Y')}</p>
+                    </div>
+                    {html_invoice}
+                    <p class="totals">
+                           {discount_line}
+                       Grand Total: ₹{final_total:,.2f}</p>
+                    <div class="footer">
+                        <p>Thank you for choosing Shyam FC Palwal!</p>
+                    </div>
+                </body>
+                </html>
+                """
+
+                html_filename = now.strftime(f"{billed_to}_%Y%m%d_%H%M%S.html")
+                html_path = output_dir / html_filename
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(html_template)
+
+                # WhatsApp link (use your current ngrok/domain)
+                # --- Convert the just-saved HTML invoice to a PNG image and show download buttons ---
+                try:
+                    # Ensure output dir exists (it already does above; this is just defensive)
+                    output_dir.mkdir(exist_ok=True)
+
+                    # Initialize html2image to render into the same folder
+                    hti = Html2Image(output_path=str(output_dir))
+
+                    # Build a PNG file name next to the HTML
+                    png_filename = now.strftime(f"{billed_to}_%Y%m%d_%H%M%S.png")
+                    png_path = output_dir / png_filename
+
+                    # Render HTML → PNG
+                    hti.screenshot(html_file=str(html_path), save_as=png_filename)
+
+                    # Show download buttons
+                    with open(png_path, "rb") as img_f:
+                        st.download_button(
+                            label="📥 Download Invoice Image (PNG)",
+                            data=img_f,
+                            file_name=png_filename,
+                            mime="image/png"
+                        )
+
+                    with open(html_path, "rb") as html_f:
+                        st.download_button(
+                            label="⬇️ Download Invoice (HTML)",
+                            data=html_f,
+                            file_name=html_filename,
+                            mime="text/html"
+                        )
+
+                except Exception as ex:
+                    st.warning(f"Could not render PNG from HTML automatically: {ex}")
+
+                # Append to billing_log.csv for analytics
+                if BILL_LOG_PATH.exists():
+                    df_log = pd.read_csv(BILL_LOG_PATH)
+                    df_combined = pd.concat([df_log, df], ignore_index=True)
+                else:
+                    df_combined = df
+                df_combined.to_csv(BILL_LOG_PATH, index=False)
+
+        if col2.button("🗑️ Clear Cart"):
+            st.session_state.cart.clear()
+            st.experimental_rerun()
+    else:
+        st.info("No items in cart.")
+
+# ---------------------- Analytics ----------------------
+with tab2:
+    st.subheader("📊 Billing Analytics")
+    if not BILL_LOG_PATH.exists():
+        st.warning("No billing history found yet.")
+    else:
+        df_log = pd.read_csv(BILL_LOG_PATH)
+
+        if "timestamp" in df_log.columns:
+            df_log["timestamp"] = pd.to_datetime(df_log["timestamp"], errors='coerce')
+            df_log.dropna(subset=["timestamp"], inplace=True)
+
+        total_bills = len(df_log)
+        total_sales = df_log["Grand Total"].sum()
+        total_profit = df_log.get("Profit", pd.Series([0]*len(df_log))).sum()
+
+        top_customers = df_log.groupby(["Billed To", "Mobile"]).agg({"Grand Total": "sum", "Profit": "sum"})
+        top_customers = top_customers.sort_values(by="Grand Total", ascending=False).head(5)
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Bills", total_bills)
+        col2.metric("Total Sales", f"₹{total_sales:,.2f}")
+        col3.metric("Total Profit", f"₹{total_profit:,.2f}")
+
+        st.markdown("### 🧍‍♂️ Top Customers by Sales")
+        st.dataframe(top_customers.rename(columns={"Grand Total": "Total Spend", "Profit": "Total Profit"}))
+
+        df_log["Month"] = df_log["timestamp"].dt.to_period("M").astype(str)
+        monthly_profit = df_log.groupby("Month").agg({"Grand Total": "sum", "Profit": "sum"}).reset_index()
+
+        st.markdown("### 📅 Monthly Summary")
+        fig, ax = plt.subplots()
+        ax.plot(monthly_profit["Month"], monthly_profit["Grand Total"], marker="o", label="Sales")
+        ax.plot(monthly_profit["Month"], monthly_profit["Profit"], marker="x", label="Profit", linestyle="--")
+        ax.set_xlabel("Month")
+        ax.set_ylabel("Amount (₹)")
+        ax.set_title("Monthly Sales & Profit Trend")
+        ax.legend()
+        plt.xticks(rotation=45)
+        st.pyplot(fig)
+
+        st.download_button(
+            "⬇️ Download Full Billing Log",
+            data=df_log.to_csv(index=False).encode("utf-8"),
+            file_name="billing_log.csv",
+            mime="text/csv"
+        )
