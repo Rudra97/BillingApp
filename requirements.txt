@@ -1,12 +1,20 @@
+# Streamlit and UI
 streamlit
-pandas
-numpy
-Pillow
-torch
-torchvision
-transformers
 matplotlib
+pillow
+
+# Image Matching
+opencv-python-headless
+numpy
+pandas
 scikit-learn
-xlsxwriter
-imagehash
+torch
+
+# CLIP
 open-clip-torch
+
+# HTML to image (current method)
+html2image
+
+# Other utilities
+pathlib
