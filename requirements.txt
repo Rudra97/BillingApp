@@ -1,6 +1,4 @@
 streamlit
-pandas
-numpy
 Pillow
 torch
 torchvision
@@ -10,15 +8,11 @@ scikit-learn
 xlsxwriter
 imagehash
 open-clip-torch
-streamlit
-matplotlib
 html2image
-opencv-python
+opencv-python-headless
 scikit-learn
-pillow
-torch
-open-clip-torch
 pandas
 numpy
+
 
 
