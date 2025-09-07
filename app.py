@@ -31,7 +31,11 @@ tab1, tab2 = st.tabs(["🧾 Billing", "📊 Analytics"])
 
 # ---------------------- CLIP Setup (fallback) ----------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model, _, preprocess = create_model_and_transforms("ViT-B-32", pretrained="openai", device=device)
+@st.cache_resource
+def load_clip_model_and_preprocess():
+    return create_model_and_transforms("ViT-B-32", pretrained="openai", device=device)
+
+model, _, preprocess = load_clip_model_and_preprocess()
 tokenizer = get_tokenizer("ViT-B-32")
 
 def _l2norm(x: np.ndarray) -> np.ndarray:
@@ -66,7 +70,7 @@ def load_catalog_df(csv_path: Path) -> pd.DataFrame:
     cols = ["item_name", "price", "image_path"] + (["cost_price"] if "cost_price" in df.columns else [])
     return df[cols].copy()
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def load_and_embed_catalog_clip(df: pd.DataFrame):
     """Return maps + names + CLIP embedding matrix (normalized)."""
     price_map, embeddings, raw_images = {}, {}, {}
@@ -218,10 +222,12 @@ with tab1:
         fname, raw = latest_photo
         try:
             image = Image.open(io.BytesIO(raw)).convert("RGB")
+            image = image.resize((256, 256))  # Resize for speed
 
             # Match logic
             matched_name: Optional[str] = None
-            orb_matches = match_with_orb(image, orb_index, min_inliers=12, top_k=5)
+            with st.spinner("Matching item with AI..."):
+                orb_matches = match_with_orb(image, orb_index, min_inliers=12, top_k=5)
 
             if orb_matches:
                 best_name, inliers = orb_matches[0]
@@ -259,7 +265,8 @@ with tab1:
 
             # Show matched item image only (not uploaded image)
             if matched_name:
-                catalog_image_path = CATALOG_DIR / catalog_df.set_index("item_name").at[matched_name, "image_path"]
+                catalog_map = catalog_df.set_index("item_name").to_dict(orient="index")
+                catalog_image_path = CATALOG_DIR / catalog_map[matched_name]["image_path"]
                 if catalog_image_path.exists():
                     matched_img = Image.open(catalog_image_path).convert("RGB")
                     st.image(matched_img, caption=f"Matched: {matched_name}", width=160)
@@ -491,7 +498,12 @@ with tab2:
     if not BILL_LOG_PATH.exists():
         st.warning("No billing history found yet.")
     else:
-        df_log = pd.read_csv(BILL_LOG_PATH)
+        @st.cache_data(ttl=600)
+        def load_billing_log():
+            return pd.read_csv(BILL_LOG_PATH, parse_dates=["timestamp"], dayfirst=True, infer_datetime_format=True)
+
+
+        df_log = load_billing_log()
 
         if "timestamp" in df_log.columns:
             df_log["timestamp"] = pd.to_datetime(df_log["timestamp"], errors='coerce')
